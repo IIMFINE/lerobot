@@ -180,6 +180,21 @@ class Robot(abc.ABC):
         pass
 
     @abc.abstractmethod
+    def get_action_cmd(self) -> dict[str, Any]:
+        """
+        Send an action command to the robot.
+
+        Args:
+            action (dict[str, Any]): Dictionary representing the desired action. Its structure should match
+                :pymeth:`action_features`.
+
+        Returns:
+            dict[str, Any]: The action actually sent to the motors potentially clipped or modified, e.g. by
+                safety limits on velocity.
+        """
+        pass
+
+    @abc.abstractmethod
     def disconnect(self) -> None:
         """Disconnect from the robot and perform any necessary cleanup."""
         pass
