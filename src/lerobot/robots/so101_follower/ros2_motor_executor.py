@@ -30,6 +30,9 @@ class MotorExecutorNode:
 
         # 创建follower_action队列
         self.follower_action = queue.Queue()
+        
+        # 创建follower_action的递归锁
+        self.follower_action_lock = threading.RLock()
 
         # 存储上一次的follower_action值
         self.last_follower_action = None
@@ -54,8 +57,9 @@ class MotorExecutorNode:
     def motor_cmd_callback(self, msg):
         """处理接收到的motor命令"""
         action = self._cmd_string_convert_action(msg.data)
-        # 将msg.data直接保存到follower_action队列中
-        self.follower_action.put(action)
+        # 使用递归锁保护follower_action队列的写操作
+        with self.follower_action_lock:
+            self.follower_action.put(action)
 
     def publish_motor_state(self):
         """定期发布motor状态"""
@@ -70,12 +74,14 @@ class MotorExecutorNode:
         Returns:
             str or None: 如果队列不为空，返回队列中的第一个动作；如果队列为空，返回上一次的值
         """
-        try:
-            action = self.follower_action.get_nowait()
-            self.last_follower_action = action  # 更新上一次的值
-            return action
-        except queue.Empty:
-            return self.last_follower_action  # 返回上一次的值
+        # 使用递归锁保护follower_action队列和last_follower_action的读写操作
+        with self.follower_action_lock:
+            try:
+                action = self.follower_action.get_nowait()
+                self.last_follower_action = action  # 更新上一次的值
+                return action
+            except queue.Empty:
+                return self.last_follower_action  # 返回上一次的值
 
     def set_motor_state(self, state_map):
         """设置motor状态
@@ -230,13 +236,13 @@ class MotorExecutorNode:
                 self.node.get_logger().warning("No valid motor IDs found")
                 return origin_map
 
-            # 调用bus_unnormalize_callback处理ID-pose映射
-            unnormalized_map = self.bus_unnormalize_callback(id_pose_map)
-            self.node.get_logger().info(f"Unnormalized map: {unnormalized_map}")
+            # 调用bus_normalize_callback处理ID-pose映射
+            normalized_map = self.bus_normalize_callback(id_pose_map)
+            self.node.get_logger().info(f"Normalized map: {normalized_map}")
 
-            # 将unnormalized_map的结果转换回电机名称并更新origin_map
+            # 将normalized_map的结果转换回电机名称并更新origin_map
             result_map = {}
-            for motor_id, unnormalized_value in unnormalized_map.items():
+            for motor_id, normalized_value in normalized_map.items():
                 # 查找对应的电机名称
                 motor_name = None
                 for name, id_val in name_to_id_map.items():
@@ -247,9 +253,9 @@ class MotorExecutorNode:
                 if motor_name:
                     # 更新origin_map中对应电机的值
                     motor_key = f"{motor_name}.pos"
-                    result_map[motor_key] = unnormalized_value
-                    self.node.get_logger().debug(
-                        f"Updated {motor_key}: {unnormalized_value}"
+                    result_map[motor_key] = normalized_value
+                    print(
+                        f"Updated {motor_key}: {normalized_value}"
                     )
                 else:
                     self.node.get_logger().warning(
