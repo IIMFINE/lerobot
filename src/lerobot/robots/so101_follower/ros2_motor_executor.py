@@ -14,16 +14,16 @@ class MotorExecutorNode:
 
         # 创建发布器，发布motor_state话题
         self.motor_state_publisher = self.node.create_publisher(
-            String, "/robot_control/motor_state", 10
+            String, "/right/robot_control/motor_state", 10
         )
 
         # 创建订阅器，订阅motor_cmd话题
         self.motor_cmd_subscriber = self.node.create_subscription(
-            String, "/robot_control/motor_cmd", self.motor_cmd_callback, 10
+            String, "/right/robot_control/motor_cmd", self.motor_cmd_callback, 10
         )
 
         # 创建定时器，定期发布motor_state
-        self.timer = self.node.create_timer(0.1, self.publish_motor_state)  # 10Hz
+        self.timer = self.node.create_timer(0.01, self.publish_motor_state)  # 10Hz
 
         # 初始化motor状态
         self.motor_state = "idle"
