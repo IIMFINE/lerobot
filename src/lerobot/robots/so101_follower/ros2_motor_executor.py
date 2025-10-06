@@ -238,7 +238,6 @@ class MotorExecutorNode:
 
             # 调用bus_normalize_callback处理ID-pose映射
             normalized_map = self.bus_normalize_callback(id_pose_map)
-            self.node.get_logger().info(f"Normalized map: {normalized_map}")
 
             # 将normalized_map的结果转换回电机名称并更新origin_map
             result_map = {}
