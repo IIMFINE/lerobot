@@ -15,21 +15,34 @@
 # limitations under the License.
 
 import logging
+import threading
 import time
+import traceback
 from functools import cached_property
 from typing import Any
 
+try:
+    import rclpy
+except ImportError:
+    rclpy = None
+
 from lerobot.cameras.utils import make_cameras_from_configs
+from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
     FeetechMotorsBus,
     OperatingMode,
 )
-from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
 from .config_so101_follower import SO101FollowerConfig
+from .filter import CriticallyDampedSmoother1D
+
+try:
+    from .ros2_motor_executor import MotorExecutorNode
+except ImportError:
+    MotorExecutorNode = None
 
 logger = logging.getLogger(__name__)
 
@@ -45,20 +58,60 @@ class SO101Follower(Robot):
     def __init__(self, config: SO101FollowerConfig):
         super().__init__(config)
         self.config = config
+
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
+
+        motor_id = 1
+        motors = {
+            "shoulder_pan": Motor(motor_id, "sts3215", norm_mode_body),
+            "shoulder_lift": Motor(motor_id + 1, "sts3215", norm_mode_body),
+            "elbow_flex": Motor(motor_id + 2, "sts3215", norm_mode_body),
+            "wrist_flex": Motor(motor_id + 3, "sts3215", norm_mode_body),
+            "wrist_roll": Motor(motor_id + 4, "sts3215", norm_mode_body),
+            "gripper": Motor(motor_id + 5, "sts3215", MotorNormMode.RANGE_0_100),
+        }
+        motor_id += 6
+
+        if config.enable_chassis:
+            motors["chassis_left"] = Motor(motor_id, "sts3215", MotorNormMode.RANGE_M100_100)
+            motors["chassis_right"] = Motor(motor_id + 1, "sts3215", MotorNormMode.RANGE_M100_100)
+            motor_id += 2
+
+        if config.enable_head:
+            motors["head_motor_1"] = Motor(motor_id, "sts3215", norm_mode_body)
+            motors["head_motor_2"] = Motor(motor_id + 1, "sts3215", norm_mode_body)
+            motor_id += 2
+
         self.bus = FeetechMotorsBus(
             port=self.config.port,
-            motors={
-                "shoulder_pan": Motor(1, "sts3215", norm_mode_body),
-                "shoulder_lift": Motor(2, "sts3215", norm_mode_body),
-                "elbow_flex": Motor(3, "sts3215", norm_mode_body),
-                "wrist_flex": Motor(4, "sts3215", norm_mode_body),
-                "wrist_roll": Motor(5, "sts3215", norm_mode_body),
-                "gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-            },
+            motors=motors,
             calibration=self.calibration,
         )
         self.cameras = make_cameras_from_configs(config.cameras)
+
+        # 初始化ROS2和MotorExecutorNode
+        self._init_ros2()
+
+        # 创建定时器线程，每10ms执行get_action并存储到motor_executor
+        self._timer_running = False
+        self._timer_thread = None
+
+        # 缓存上一次成功获取的action命令
+        self._last_action_cmd = None
+
+        # 为每个电机创建滤波器
+        self._smoothers = {}
+        for motor_name in self.bus.motors.keys():
+            self._smoothers[motor_name] = CriticallyDampedSmoother1D(
+                tau=0.05,
+                v_limit=20000,
+                a_limit=None,
+                vel_ema_alpha=0.1,
+                duplicate_epsilon=0.001,
+            )
+
+        # 缓存上一次的时间戳，用于计算dt
+        self._last_time = None
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -101,6 +154,10 @@ class SO101Follower(Robot):
             cam.connect()
 
         self.configure()
+
+        # 启动定时器线程
+        self._start_action_timer()
+
         logger.info(f"{self} connected.")
 
     @property
@@ -114,7 +171,9 @@ class SO101Follower(Robot):
                 f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
             )
             if user_input.strip().lower() != "c":
-                logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
+                logger.info(
+                    f"Writing calibration file associated with the id {self.id} to the motors"
+                )
                 self.bus.write_calibration(self.calibration)
                 return
 
@@ -150,7 +209,14 @@ class SO101Follower(Robot):
         with self.bus.torque_disabled():
             self.bus.configure_motors()
             for motor in self.bus.motors:
-                self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+                try:
+                    if motor.startswith("chassis") and self.config.enable_chassis:
+                        self.bus.write("Operating_Mode", motor, OperatingMode.VELOCITY.value)
+                        self.bus.write("Goal_Velocity", motor, 0, normalize=False)
+                    else:
+                        self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+                except Exception as e:
+                    raise e
                 # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
                 self.bus.write("P_Coefficient", motor, 16)
                 # Set I_Coefficient and D_Coefficient to default value 0 and 32
@@ -161,12 +227,18 @@ class SO101Follower(Robot):
                     self.bus.write(
                         "Max_Torque_Limit", motor, 500
                     )  # 50% of the max torque limit to avoid burnout
-                    self.bus.write("Protection_Current", motor, 250)  # 50% of max current to avoid burnout
-                    self.bus.write("Overload_Torque", motor, 25)  # 25% torque when overloaded
+                    self.bus.write(
+                        "Protection_Current", motor, 250
+                    )  # 50% of max current to avoid burnout
+                    self.bus.write(
+                        "Overload_Torque", motor, 25
+                    )  # 25% torque when overloaded
 
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
-            input(f"Connect the controller board to the '{motor}' motor only and press enter.")
+            input(
+                f"Connect the controller board to the '{motor}' motor only and press enter."
+            )
             self.bus.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
 
@@ -176,8 +248,8 @@ class SO101Follower(Robot):
 
         # Read arm position
         start = time.perf_counter()
-        obs_dict = self.bus.sync_read("Present_Position")
-        obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
+        obs_positions = self.bus.sync_read("Present_Position")
+        obs_dict: dict[str, Any] = {f"{motor}.pos": val for motor, val in obs_positions.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
@@ -210,18 +282,317 @@ class SO101Follower(Robot):
 
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.
+        # 分离底盘和非底盘的goal_pos
+        chassis_goal_pos = {key: val for key, val in goal_pos.items() if key.startswith("chassis")}
+        non_chassis_goal_pos = {key: val for key, val in goal_pos.items() if not key.startswith("chassis")}
+
         if self.config.max_relative_target is not None:
             present_pos = self.bus.sync_read("Present_Position")
-            goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in goal_pos.items()}
-            goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
 
-        # Send goal position to the arm
-        self.bus.sync_write("Goal_Position", goal_pos)
-        return {f"{motor}.pos": val for motor, val in goal_pos.items()}
+            # 只对非底盘电机进行安全位置限制
+            if non_chassis_goal_pos:
+                goal_present_pos = {
+                    key: (g_pos, present_pos[key]) for key, g_pos in non_chassis_goal_pos.items()
+                }
+                non_chassis_goal_pos = ensure_safe_goal_position(
+                    goal_present_pos, self.config.max_relative_target
+                )
+
+        # Send goal position to the arm (non-chassis motors)
+        if non_chassis_goal_pos:
+            self.bus.sync_write("Goal_Position", non_chassis_goal_pos)
+
+        # Send goal velocity to the chassis motors
+        if chassis_goal_pos:
+            # Clamp to valid sign-magnitude range and cast to int
+            clamped = {}
+            for k, v in chassis_goal_pos.items():
+                try:
+                    iv = int(v)
+                except Exception:
+                    continue
+                if iv > 32767:
+                    iv = 32767
+                if iv < -32767:
+                    iv = -32767
+                clamped[k] = iv
+            if clamped:
+                self.bus.sync_write("Goal_Velocity", clamped, normalize=False)
+
+        # 合并返回值
+        result = {f"{motor}.pos": val for motor, val in non_chassis_goal_pos.items()}
+        result.update({f"{motor}.pos": val for motor, val in chassis_goal_pos.items()})
+        return result
+
+    def get_action_cmd(self) -> dict[str, Any] | None:
+        """从 ROS2 motor executor 中获取动作命令，并使用滤波器进行平滑
+
+        Returns:
+            dict[str, Any] | None: 从 motor executor 队列中获取的动作命令，如果没有可用命令则返回上一次的值
+        """
+        if not hasattr(self, "motor_executor") or self.motor_executor is None:
+            # logger.warning("Motor executor not initialized, cannot get action command")
+            return self._last_action_cmd
+
+        try:
+            # 从 motor_executor 获取 follower_action
+            action_str = self.motor_executor.pop_follower_action()
+
+            if action_str is None:
+                return self._last_action_cmd
+
+            # 如果是字符串，尝试解析为 JSON
+            if isinstance(action_str, str):
+                try:
+                    import json
+
+                    action_dict = json.loads(action_str)
+
+                    # 应用滤波器
+                    filtered_action = self._apply_filter(action_dict)
+
+                    self._last_action_cmd = filtered_action
+                    return filtered_action
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"Failed to parse action command as JSON: {action_str}"
+                    )
+                    raw_action = {"raw_command": action_str}
+                    self._last_action_cmd = raw_action
+                    return raw_action
+            else:
+                # 如果不是字符串，直接应用滤波
+                filtered_action = self._apply_filter(action_str)
+                self._last_action_cmd = filtered_action
+                return filtered_action
+
+        except Exception as e:
+            logger.error(f"Error getting action command from motor executor: {e}")
+            return self._last_action_cmd
+
+    def get_chassis_cmd(self) -> dict[str, Any] | None:
+        """从 ROS2 motor executor 中获取底盘命令
+
+        Returns:
+            dict[str, Any] | None: 从 motor executor 队列中获取的底盘命令，如果没有可用命令则返回 None
+        """
+        if not hasattr(self, "motor_executor") or self.motor_executor is None:
+            # logger.warning("Motor executor not initialized, cannot get chassis command")
+            return None
+
+        try:
+            # 从 motor_executor 获取 chassis_action
+            chassis_str = self.motor_executor.pop_chassis_action()
+
+            if chassis_str is None:
+                return None
+
+            chassis_dict = None
+
+            # 如果是字符串，尝试解析为 JSON
+            if isinstance(chassis_str, str):
+                try:
+                    import json
+
+                    chassis_dict = json.loads(chassis_str)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"Failed to parse chassis command as JSON: {chassis_str}"
+                    )
+                    return {"raw_command": chassis_str}
+            elif isinstance(chassis_str, dict):
+                chassis_dict = chassis_str
+            else:
+                return chassis_str
+
+            # 统一处理：为没有 .pos 结尾的 key 添加 .pos 后缀，并检查key是否在bus中
+            result = {}
+            for key, val in chassis_dict.items():
+                motor_name = key.removesuffix(".pos")
+                if motor_name not in self.bus.motors:
+                    continue
+
+                if not key.endswith(".pos"):
+                    result[f"{key}.pos"] = val
+                else:
+                    result[key] = val
+            return result
+
+        except Exception as e:
+            logger.error(f"Error getting chassis command from motor executor: {e}")
+            return None
+
+    def _apply_filter(self, action_dict: dict[str, Any]) -> dict[str, Any]:
+        """应用临界阻尼滤波器到动作命令
+
+        Args:
+            action_dict: 原始动作命令字典
+
+        Returns:
+            dict[str, Any]: 滤波后的动作命令
+        """
+        if not isinstance(action_dict, dict):
+            return action_dict
+
+        # 计算时间间隔
+        current_time = time.perf_counter()
+        if self._last_time is None:
+            self._last_time = current_time
+            return action_dict
+
+        dt = current_time - self._last_time
+        self._last_time = current_time
+
+        if dt <= 0.0:
+            return action_dict
+
+        # 获取当前电机位置
+        try:
+            current_pos = self.bus.sync_read("Present_Position")
+        except Exception as e:
+            logger.warning(f"Failed to read current position for filtering: {e}")
+            return action_dict
+
+        # 对每个电机位置应用滤波
+        filtered_action = {}
+        for key, target_val in action_dict.items():
+            if key.endswith(".pos"):
+                motor_name = key.removesuffix(".pos")
+                if motor_name in self._smoothers and motor_name in current_pos:
+                    # 应用滤波器
+                    filtered_val = self._smoothers[motor_name].update(
+                        pos=current_pos[motor_name], target=target_val, dt=dt
+                    )
+                    filtered_action[key] = filtered_val
+                else:
+                    filtered_action[key] = target_val
+            else:
+                filtered_action[key] = target_val
+
+        return filtered_action
+
+    def _start_action_timer(self):
+        """启动定时器线程，每10ms执行get_action并存储到motor_executor"""
+        if self._timer_running:
+            return
+
+        self._timer_running = True
+        self._timer_thread = threading.Thread(target=self._timer_worker, daemon=True)
+        self._timer_thread.start()
+        logger.info("Action timer started (10ms interval)")
+
+    def _stop_action_timer(self):
+        """停止定时器线程"""
+        if not self._timer_running:
+            return
+
+        self._timer_running = False
+        if self._timer_thread and self._timer_thread.is_alive():
+            self._timer_thread.join(timeout=1.0)
+        logger.info("Action timer stopped")
+
+    def _timer_worker(self):
+        """定时器工作线程，每10ms执行一次"""
+        while self._timer_running:
+            try:
+                if self.is_connected:
+                    # 获取当前action
+                    action = self._get_action_internal()
+                    # 存储到motor_executor
+                    if self.motor_executor is not None:
+                        self.motor_executor.set_motor_state(action)
+            except Exception as e:
+                logger.error(f"Timer worker error: {e}")
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
+
+            time.sleep(0.01)  # 10ms间隔
+
+    def _get_action_internal(self) -> dict[str, float]:
+        """内部使用的get_action方法，不包含debug日志"""
+        action = self.bus.sync_read("Present_Position")
+        action = {f"{motor}.pos": val for motor, val in action.items()}
+        return action
+
+    def _register_motor_executor_methods(self):
+        """Register _normalize and _unnormalize methods to motor_executor"""
+        if self.motor_executor is None:
+            logger.warning(
+                "Motor executor not available, cannot register normalize methods"
+            )
+            return
+
+        try:
+            # 获取bus的normalize和unnormalize方法
+            normalize_method = self.bus._normalize
+            unnormalize_method = self.bus._unnormalize
+
+            # 使用专门的函数来注册callback
+            self.motor_executor.set_bus_normalize_callback(normalize_method)
+            self.motor_executor.set_bus_unnormalize_callback(unnormalize_method)
+            self.motor_executor.set_get_motor_id_callback(self.bus._get_motor_id)
+
+            logger.info(
+                "Successfully registered _normalize and _unnormalize methods to motor_executor"
+            )
+
+        except Exception as e:
+            logger.error(f"Error registering normalize methods to motor_executor: {e}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
+
+    def _init_ros2(self):
+        """Initialize ROS2 and create MotorExecutorNode"""
+        try:
+            # 检查是否有 rclpy 模块
+            if rclpy is None:
+                raise ImportError("rclpy module not available")
+
+            # 检查是否有 MotorExecutorNode 类
+            if MotorExecutorNode is None:
+                raise ImportError("MotorExecutorNode not available")
+
+            # 检查rclpy是否已经初始化
+            if not rclpy.ok():
+                rclpy.init()
+                self._rclpy_initialized_by_us = True
+            else:
+                self._rclpy_initialized_by_us = False
+
+            # 创建MotorExecutorNode
+            self.motor_executor = MotorExecutorNode(arm_side=self.config.arm_side, enable_chassis=self.config.enable_chassis)
+            logger.info("ROS2 MotorExecutorNode initialized successfully")
+
+            # 注册 _normalize 和 _unnormalize 方法到 motor_executor
+            self._register_motor_executor_methods()
+
+        except ImportError as e:
+            logger.warning(
+                f"ROS2/rclpy not available: {e}. Running without ROS2 integration."
+            )
+            self.motor_executor = None
+            self._rclpy_initialized_by_us = False
+        except Exception as e:
+            logger.warning(f"Failed to initialize ROS2 MotorExecutorNode: {e}")
+            self.motor_executor = None
+            self._rclpy_initialized_by_us = False
 
     def disconnect(self):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        # 停止定时器
+        self._stop_action_timer()
+
+        # 关闭motor_executor
+        if hasattr(self, "motor_executor") and self.motor_executor is not None:
+            self.motor_executor.shutdown()
+
+        # 如果我们初始化了rclpy，则需要关闭它
+        if hasattr(self, "_rclpy_initialized_by_us") and self._rclpy_initialized_by_us:
+            try:
+                if rclpy is not None:
+                    rclpy.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down rclpy: {e}")
 
         self.bus.disconnect(self.config.disable_torque_on_disconnect)
         for cam in self.cameras.values():

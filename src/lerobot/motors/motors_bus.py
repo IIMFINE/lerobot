@@ -1245,9 +1245,9 @@ class MotorsBus(abc.ABC):
             comm = self.sync_writer.txPacket()
             if self._is_comm_success(comm):
                 break
-            result = self.packet_handler.getTxRxResult(comm)
             logger.debug(
-                f"Failed to sync write @{addr=} ({length=}) with {ids_values=} ({n_try=}): {result}"
+                f"Failed to sync write @{addr=} ({length=}) with {ids_values=} ({n_try=}): "
+                + self.packet_handler.getTxRxResult(comm)
             )
 
         if not self._is_comm_success(comm) and raise_on_error:

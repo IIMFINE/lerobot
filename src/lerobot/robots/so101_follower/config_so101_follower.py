@@ -39,3 +39,12 @@ class SO101FollowerConfig(RobotConfig):
 
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
+
+    # Arm side: "left" or "right", used as ROS2 topic prefix
+    arm_side: str = "right"
+
+    # Enable chassis motors
+    enable_chassis: bool = False
+
+    # Enable head motors
+    enable_head: bool = False

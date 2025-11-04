@@ -23,7 +23,7 @@ lerobot-replay \
     --robot.port=/dev/tty.usbmodem58760431541 \
     --robot.id=black \
     --dataset.repo_id=aliberts/record-test \
-    --dataset.episode=0
+    --dataset.episode=2
 ```
 
 Example replay with bimanual so100:
@@ -45,18 +45,18 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from pprint import pformat
 
-from lerobot.configs import parser
+import draccus
+
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.processor import (
-    make_default_robot_action_processor,
-)
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_so100_follower,
+    bi_so101_follower,
     hope_jr,
     koch_follower,
     make_robot_from_config,
+    reachy2,
     so100_follower,
     so101_follower,
 )
@@ -87,12 +87,10 @@ class ReplayConfig:
     play_sounds: bool = True
 
 
-@parser.wrap()
+@draccus.wrap()
 def replay(cfg: ReplayConfig):
     init_logging()
     logging.info(pformat(asdict(cfg)))
-
-    robot_action_processor = make_default_robot_action_processor()
 
     robot = make_robot_from_config(cfg.robot)
     dataset = LeRobotDataset(cfg.dataset.repo_id, root=cfg.dataset.root, episodes=[cfg.dataset.episode])
@@ -112,11 +110,7 @@ def replay(cfg: ReplayConfig):
         for i, name in enumerate(dataset.features["action"]["names"]):
             action[name] = action_array[i]
 
-        robot_obs = robot.get_observation()
-
-        processed_action = robot_action_processor((action, robot_obs))
-
-        _ = robot.send_action(processed_action)
+        robot.send_action(action)
 
         dt_s = time.perf_counter() - start_episode_t
         busy_wait(1 / dataset.fps - dt_s)
