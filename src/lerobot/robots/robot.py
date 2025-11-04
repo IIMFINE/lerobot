@@ -19,8 +19,8 @@ from typing import Any
 
 import draccus
 
-from lerobot.constants import HF_LEROBOT_CALIBRATION, ROBOTS
 from lerobot.motors import MotorCalibration
+from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, ROBOTS
 
 from .config import RobotConfig
 
@@ -166,21 +166,6 @@ class Robot(abc.ABC):
 
     @abc.abstractmethod
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        """
-        Send an action command to the robot.
-
-        Args:
-            action (dict[str, Any]): Dictionary representing the desired action. Its structure should match
-                :pymeth:`action_features`.
-
-        Returns:
-            dict[str, Any]: The action actually sent to the motors potentially clipped or modified, e.g. by
-                safety limits on velocity.
-        """
-        pass
-
-    @abc.abstractmethod
-    def get_action_cmd(self) -> dict[str, Any]:
         """
         Send an action command to the robot.
 
